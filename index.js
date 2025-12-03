@@ -25,7 +25,8 @@ function getAllowedOrigins() {
     return ['http://localhost:5173', 'http://localhost:8080', 'http://localhost:3000'];
   }
   
-  return process.env.FRONTEND_URL
+  // Split by comma and clean each URL
+  const urls = process.env.FRONTEND_URL
     .split(',')
     .map(url => {
       // Remove leading/trailing whitespace
@@ -36,6 +37,12 @@ function getAllowedOrigins() {
     })
     .filter(url => url.length > 0) // Remove empty strings
     .filter((url, index, self) => self.indexOf(url) === index); // Remove duplicates
+  
+  // Log for debugging
+  console.log('🌍 CORS Allowed Origins:', urls);
+  console.log('🌍 FRONTEND_URL from env:', process.env.FRONTEND_URL);
+  
+  return urls;
 }
 
 const allowedOrigins = getAllowedOrigins();
@@ -76,18 +83,39 @@ app.use(cors({
   optionsSuccessStatus: 204
 }));
 
-// Additional middleware to ensure single CORS header
+// Additional middleware to ensure single CORS header (runs after CORS middleware)
 app.use((req, res, next) => {
-  // Remove any duplicate CORS headers that might have been set
+  // Store original setHeader function
+  const originalSetHeader = res.setHeader.bind(res);
+  
+  // Override setHeader to prevent duplicate CORS headers
+  res.setHeader = function(name, value) {
+    if (name.toLowerCase() === 'access-control-allow-origin') {
+      // Remove any existing Access-Control-Allow-Origin headers first
+      if (res.getHeader('Access-Control-Allow-Origin')) {
+        res.removeHeader('Access-Control-Allow-Origin');
+      }
+      // Normalize the value (remove trailing slash)
+      const normalizedValue = String(value).split(',')[0].trim().replace(/\/+$/, '');
+      return originalSetHeader('Access-Control-Allow-Origin', normalizedValue);
+    }
+    return originalSetHeader(name, value);
+  };
+  
+  // Also handle the origin header directly
   const origin = req.headers.origin;
   if (origin) {
     const normalizedOrigin = origin.replace(/\/+$/, '');
     if (allowedOrigins.indexOf(normalizedOrigin) !== -1) {
-      // Set only one Access-Control-Allow-Origin header
-      res.removeHeader('Access-Control-Allow-Origin');
+      // Remove any existing headers
+      if (res.getHeader('Access-Control-Allow-Origin')) {
+        res.removeHeader('Access-Control-Allow-Origin');
+      }
+      // Set only one header
       res.setHeader('Access-Control-Allow-Origin', normalizedOrigin);
     }
   }
+  
   next();
 });
 app.use(express.json());
