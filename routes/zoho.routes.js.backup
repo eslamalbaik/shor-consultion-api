@@ -1,0 +1,420 @@
+/**
+ * Zoho CRM Routes
+ * Handles form submissions and integration with Zoho CRM
+ */
+
+const express = require('express');
+const router = express.Router();
+const https = require('https');
+const ZohoTokenManager = require('../utils/tokenManager');
+
+// Initialize token manager (will be set by server)
+let tokenManager = null;
+
+/**
+ * Initialize token manager with config
+ */
+function initializeTokenManager(config) {
+  tokenManager = new ZohoTokenManager(config);
+}
+
+/**
+ * Make API request to Zoho CRM
+ */
+function makeZohoAPIRequest(token, endpoint, method = 'GET', data = null) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(endpoint, process.env.ZOHO_API_BASE || 'https://www.zohoapis.com');
+    
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: method,
+      headers: {
+        'Authorization': `Zoho-oauthtoken ${token}`,
+        'Content-Type': 'application/json'
+      }
+    };
+
+    if (data && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+      const postData = JSON.stringify(data);
+      options.headers['Content-Length'] = Buffer.byteLength(postData);
+    }
+
+    const req = https.request(options, (res) => {
+      let responseData = '';
+
+      res.on('data', (chunk) => {
+        responseData += chunk;
+      });
+
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(responseData);
+
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(parsed);
+          } else {
+            // Check for INVALID_TOKEN - Zoho returns various formats
+            const errorMessage = parsed.error?.message || parsed.message || parsed.data?.[0]?.message || parsed.data?.[0]?.status || 'API request failed';
+            const errorCode = parsed.code || parsed.error?.code || parsed.data?.[0]?.code || 'API_ERROR';
+            
+            // Get detailed error information
+            const errorDetails = parsed.data?.[0]?.details || parsed.data?.[0] || parsed.error || parsed;
+            
+            const error = {
+              code: errorCode,
+              message: errorMessage,
+              statusCode: res.statusCode,
+              details: errorDetails,
+              fullResponse: parsed
+            };
+
+            // Check if it's an invalid token error (401 or specific error codes)
+            const errorString = JSON.stringify(parsed).toUpperCase();
+            if (res.statusCode === 401 ||
+                errorCode === 'INVALID_TOKEN' ||
+                errorCode === 'AUTHENTICATION_FAILURE' ||
+                errorMessage.toUpperCase().includes('INVALID_TOKEN') ||
+                errorMessage.toUpperCase().includes('INVALID_OAUTH') ||
+                errorString.includes('INVALID_TOKEN') ||
+                errorString.includes('AUTHENTICATION_FAILURE')) {
+              error.code = 'INVALID_TOKEN';
+            }
+
+            reject(error);
+          }
+        } catch (error) {
+          reject({
+            code: 'PARSE_ERROR',
+            message: 'Failed to parse API response',
+            statusCode: res.statusCode,
+            rawResponse: responseData
+          });
+        }
+      });
+    });
+
+    req.on('error', (error) => {
+      reject({
+        code: 'REQUEST_ERROR',
+        message: error.message,
+        error: error
+      });
+    });
+
+    if (data && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+      req.write(JSON.stringify(data));
+    }
+
+    req.end();
+  });
+}
+
+/**
+ * Create a lead or contact in Zoho CRM from form submission
+ */
+async function createZohoRecord(token, recordData) {
+  // Determine if this should be a Lead or Contact
+  // You can customize this logic based on your needs
+  const module = recordData.module || 'Leads'; // Default to Leads
+
+  const endpoint = `/crm/v3/${module}`;
+  
+  // Build base record
+  const baseRecord = {
+    Last_Name: recordData.lastName || recordData.name || 'N/A',
+    First_Name: recordData.firstName || '',
+    Email: recordData.email || '',
+    Phone: recordData.phone || recordData.mobile || '',
+    Description: recordData.description || recordData.message || recordData.question || '',
+    Lead_Source: recordData.leadSource || 'Website Form'
+  };
+
+  // Add additional fields based on module type
+  if (module === 'Leads') {
+    // Use Company field for file number in medical consultations
+    if (recordData.fileNumber) {
+      baseRecord.Company = recordData.fileNumber;
+    } else if (recordData.company) {
+      baseRecord.Company = recordData.company;
+    }
+    
+    // Set Lead Status from custom fields
+    if (recordData.customFields && recordData.customFields.Status) {
+      baseRecord.Lead_Status = recordData.customFields.Status;
+    }
+  }
+
+  if (module === 'Contacts') {
+    if (recordData.accountName) baseRecord.Account_Name = recordData.accountName;
+  }
+
+  // Prepare custom fields (excluding Status as it's handled above)
+  const customFields = { ...recordData.customFields };
+  if (customFields.Status) {
+    delete customFields.Status; // Already used in Lead_Status
+  }
+
+  // Clean and format custom fields
+  const cleanedCustomFields = {};
+  for (const [key, value] of Object.entries(customFields)) {
+    // Skip null, undefined, or empty strings
+    if (value !== null && value !== undefined && value !== '') {
+      // Format datetime fields (field is datetime type in Zoho)
+      if (key === 'field' && typeof value === 'string') {
+        // Zoho datetime field expects ISO 8601 format: YYYY-MM-DDTHH:mm:ss+HH:mm
+        // or at minimum: YYYY-MM-DDTHH:mm:ss
+        try {
+          const date = new Date(value);
+          if (!isNaN(date.getTime())) {
+            // Format as ISO 8601 datetime string
+            // If only date provided, add time component
+            if (value.match(/^\d{4}-\d{2}-\d{2}$/)) {
+              // Date only format (YYYY-MM-DD), add time
+              cleanedCustomFields[key] = `${value}T00:00:00+03:00`;
+            } else if (value.includes('T')) {
+              // Already has time, use as is
+              cleanedCustomFields[key] = value;
+            } else {
+              // Try to parse and format
+              const isoString = date.toISOString();
+              // Convert UTC to local timezone (GMT+3 for Saudi Arabia)
+              cleanedCustomFields[key] = isoString.replace('Z', '+03:00');
+            }
+          } else {
+            cleanedCustomFields[key] = value;
+          }
+        } catch (e) {
+          // If parsing fails, try to format manually
+          if (value.match(/^\d{4}-\d{2}-\d{2}$/)) {
+            cleanedCustomFields[key] = `${value}T00:00:00+03:00`;
+          } else {
+            cleanedCustomFields[key] = value;
+          }
+        }
+      } else {
+        cleanedCustomFields[key] = value;
+      }
+    }
+  }
+
+  // Merge custom fields (they take precedence)
+  const finalRecord = {
+    ...baseRecord,
+    ...cleanedCustomFields
+  };
+
+  // Remove any undefined or null values from final record
+  const cleanedRecord = {};
+  for (const [key, value] of Object.entries(finalRecord)) {
+    if (value !== null && value !== undefined) {
+      cleanedRecord[key] = value;
+    }
+  }
+
+  // Log the data being sent for debugging
+  console.log('📤 Sending to Zoho CRM:', JSON.stringify(cleanedRecord, null, 2));
+
+  const zohoData = {
+    data: [cleanedRecord]
+  };
+
+  const result = await makeZohoAPIRequest(token, endpoint, 'POST', zohoData);
+  
+  // Log response for debugging
+  if (process.env.NODE_ENV === 'development') {
+    console.log('📥 Response from Zoho CRM:', JSON.stringify(result, null, 2));
+  }
+
+  return result;
+}
+
+/**
+ * POST /api/zoho/submit
+ * Submit form data to Zoho CRM
+ */
+router.post('/submit', async (req, res) => {
+  try {
+    if (!tokenManager) {
+      return res.status(500).json({
+        success: false,
+        error: 'Token manager not initialized'
+      });
+    }
+
+    const {
+      name,
+      email,
+      phone,
+      mobile,
+      message,
+      question,
+      module = 'Leads', // 'Leads' or 'Contacts'
+      leadSource = 'Website Form',
+      firstName,
+      lastName,
+      company,
+      fileNumber,
+      description,
+      customFields = {}
+    } = req.body;
+
+    // Validation
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email is required'
+      });
+    }
+
+    // Prepare record data
+    const recordData = {
+      name: name || '',
+      email: email,
+      phone: phone || mobile || '',
+      message: message || question || description || '',
+      module: module,
+      leadSource: leadSource,
+      firstName: firstName,
+      lastName: lastName,
+      company: company,
+      fileNumber: fileNumber,
+      customFields: customFields
+    };
+
+    // Execute with automatic token refresh on INVALID_TOKEN
+    const result = await tokenManager.executeWithRetry(async (token) => {
+      return await createZohoRecord(token, recordData);
+    });
+
+    // Check if record was created successfully
+    if (result.data && result.data.length > 0) {
+      const recordResult = result.data[0];
+      
+      if (recordResult.status === 'success') {
+        return res.status(200).json({
+          success: true,
+          message: 'Form submitted successfully to Zoho CRM',
+          data: {
+            id: recordResult.details?.id,
+            module: module
+          }
+        });
+      } else {
+        // Record created but with warnings/errors
+        console.warn('⚠️ Zoho record created with warnings:', recordResult);
+        return res.status(200).json({
+          success: true,
+          message: 'Form submitted to Zoho CRM with warnings',
+          data: {
+            id: recordResult.details?.id,
+            module: module,
+            warnings: recordResult.message || recordResult.details
+          }
+        });
+      }
+    } else {
+      // Log the full response for debugging
+      console.error('❌ Failed to create record. Full response:', JSON.stringify(result, null, 2));
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to create record in Zoho CRM',
+        details: process.env.NODE_ENV === 'development' ? result : undefined
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ Zoho submission error:', error);
+    console.error('❌ Error details:', JSON.stringify(error, null, 2));
+
+    // Handle specific error types
+    if (error.code === 'INVALID_TOKEN') {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication failed. Please check your Zoho credentials.'
+      });
+    }
+
+    // Handle INVALID_DATA error with more details
+    if (error.code === 'INVALID_DATA' || error.statusCode === 400) {
+      console.error('❌ INVALID_DATA - Full error details:');
+      console.error(JSON.stringify(error.details, null, 2));
+      console.error('❌ Full error object:');
+      console.error(JSON.stringify(error, null, 2));
+      
+      // Try to extract field-specific errors
+      const fieldErrors = [];
+      if (error.details?.data && Array.isArray(error.details.data)) {
+        error.details.data.forEach((item, index) => {
+          if (item.details) {
+            fieldErrors.push(`Record ${index + 1}: ${JSON.stringify(item.details)}`);
+          }
+          if (item.message) {
+            fieldErrors.push(`Record ${index + 1}: ${item.message}`);
+          }
+        });
+      }
+      
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid data sent to Zoho CRM',
+        message: error.message,
+        fieldErrors: fieldErrors.length > 0 ? fieldErrors : undefined,
+        details: error.details || error
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'An error occurred while submitting to Zoho CRM',
+      code: error.code,
+      details: process.env.NODE_ENV === 'development' ? error : undefined
+    });
+  }
+});
+
+/**
+ * GET /api/zoho/test
+ * Test endpoint to verify Zoho connection
+ */
+router.get('/test', async (req, res) => {
+  try {
+    if (!tokenManager) {
+      return res.status(500).json({
+        success: false,
+        error: 'Token manager not initialized'
+      });
+    }
+
+    // Test by getting a valid token
+    const token = await tokenManager.getValidAccessToken();
+
+    // Optionally, make a test API call
+    const result = await tokenManager.executeWithRetry(async (token) => {
+      return await makeZohoAPIRequest(token, '/crm/v3/settings/modules', 'GET');
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Zoho connection is working',
+      data: {
+        modulesCount: result.modules?.length || 0
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Zoho test error:', error);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to connect to Zoho CRM',
+      details: process.env.NODE_ENV === 'development' ? error : undefined
+    });
+  }
+});
+
+module.exports = {
+  router,
+  initializeTokenManager
+};
+

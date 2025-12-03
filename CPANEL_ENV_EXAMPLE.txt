@@ -1,0 +1,24 @@
+# ملف Environment Variables لـ cPanel/GoDaddy
+# انسخ هذا المحتوى إلى Environment Variables في Node.js App
+# أو أنشئ ملف .env في مجلد server
+
+NODE_ENV=production
+
+# Zoho CRM Configuration
+ZOHO_CLIENT_ID=your_zoho_client_id_here
+ZOHO_CLIENT_SECRET=your_zoho_client_secret_here
+ZOHO_REFRESH_TOKEN=your_zoho_refresh_token_here
+ZOHO_REDIRECT_URI=https://yourdomain.com/auth/zoho/callback
+
+# Frontend URL (for CORS)
+FRONTEND_URL=https://yourdomain.com,https://www.yourdomain.com
+
+# Port (اتركه فارغاً - GoDaddy يحدده تلقائياً)
+# PORT=
+
+# ExtraBitFree API Configuration (اختياري)
+# EXTRABITFREE_API_BASE=https://api.extrabitfree.com
+# EXTRABITFREE_API_KEY=your_api_key_here (إذا كان مطلوباً)
+
+# ملاحظة: لا تضيف PORT إلا إذا طُلب منك في cPanel
+
