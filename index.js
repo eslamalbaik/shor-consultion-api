@@ -18,10 +18,29 @@ const app = express();
 
 // Middleware - CORS Configuration
 const isDevelopment = process.env.NODE_ENV !== 'production';
-const allowedOrigins = process.env.FRONTEND_URL 
-  ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
-  : ['http://localhost:5173', 'http://localhost:8080', 'http://localhost:3000'];
 
+// Clean and normalize allowed origins
+function getAllowedOrigins() {
+  if (!process.env.FRONTEND_URL) {
+    return ['http://localhost:5173', 'http://localhost:8080', 'http://localhost:3000'];
+  }
+  
+  return process.env.FRONTEND_URL
+    .split(',')
+    .map(url => {
+      // Remove leading/trailing whitespace
+      url = url.trim();
+      // Remove trailing slash
+      url = url.replace(/\/+$/, '');
+      return url;
+    })
+    .filter(url => url.length > 0) // Remove empty strings
+    .filter((url, index, self) => self.indexOf(url) === index); // Remove duplicates
+}
+
+const allowedOrigins = getAllowedOrigins();
+
+// CORS middleware with proper header handling
 app.use(cors({
   origin: function (origin, callback) {
     // Allow requests with no origin (like mobile apps or curl requests)
@@ -36,20 +55,41 @@ app.use(cors({
       }
     }
     
+    // Normalize origin (remove trailing slash)
+    const normalizedOrigin = origin.replace(/\/+$/, '');
+    
     // Check if origin is in allowed list
-    if (allowedOrigins.indexOf(origin) !== -1) {
+    if (allowedOrigins.indexOf(normalizedOrigin) !== -1) {
       return callback(null, true);
     }
     
     // Block the request
     const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
-    console.warn(`⚠️  CORS blocked origin: ${origin}`);
+    console.warn(`⚠️  CORS blocked origin: ${origin} (allowed: ${allowedOrigins.join(', ')})`);
     callback(new Error(msg), false);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  // Ensure only one origin is returned
+  preflightContinue: false,
+  optionsSuccessStatus: 204
 }));
+
+// Additional middleware to ensure single CORS header
+app.use((req, res, next) => {
+  // Remove any duplicate CORS headers that might have been set
+  const origin = req.headers.origin;
+  if (origin) {
+    const normalizedOrigin = origin.replace(/\/+$/, '');
+    if (allowedOrigins.indexOf(normalizedOrigin) !== -1) {
+      // Set only one Access-Control-Allow-Origin header
+      res.removeHeader('Access-Control-Allow-Origin');
+      res.setHeader('Access-Control-Allow-Origin', normalizedOrigin);
+    }
+  }
+  next();
+});
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -88,19 +128,24 @@ app.use('/api/zoho', zohoFieldsRouter);
 // Register ExtraBitFree routes
 app.use('/api/extrabitfree', extrabitfreeRouter);
 
+// Debug: Log all registered routes
+console.log('📋 Registered API routes:');
+console.log('   POST /api/zoho/submit');
+console.log('   GET  /api/zoho/test');
+console.log('   GET  /api/extrabitfree/*');
+console.log('   POST /api/extrabitfree/*');
+
 // Serve static files from frontend build (in production)
 if (process.env.NODE_ENV === 'production') {
   const frontendBuildPath = path.join(__dirname, '..', 'frontend', 'dist');
   app.use(express.static(frontendBuildPath));
   
   // Catch-all handler: send back React's index.html file for client-side routing
-  app.get('*', (req, res) => {
+  // Only for GET requests and non-API routes
+  app.get('*', (req, res, next) => {
     // Don't serve index.html for API routes
     if (req.path.startsWith('/api/')) {
-      return res.status(404).json({
-        success: false,
-        error: 'Endpoint not found'
-      });
+      return next(); // Let 404 handler catch it
     }
     res.sendFile(path.join(frontendBuildPath, 'index.html'));
   });
@@ -131,12 +176,24 @@ app.use((err, req, res, next) => {
   });
 });
 
-// 404 handler (only for API routes in development)
+// 404 handler for API routes
+app.use('/api/*', (req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'Endpoint not found',
+    path: req.path,
+    method: req.method
+  });
+});
+
+// 404 handler for non-API routes (only in development)
 if (process.env.NODE_ENV !== 'production') {
   app.use((req, res) => {
     res.status(404).json({
       success: false,
-      error: 'Endpoint not found'
+      error: 'Endpoint not found',
+      path: req.path,
+      method: req.method
     });
   });
 }
@@ -153,6 +210,7 @@ app.listen(PORT, HOST, () => {
   console.log(`📋 Health check: http://${HOST}:${PORT}/health`);
   console.log(`🧪 Zoho test: http://${HOST}:${PORT}/api/zoho/test`);
   console.log(`🌐 ExtraBitFree proxy: http://${HOST}:${PORT}/api/extrabitfree/*`);
+  console.log(`🌍 Allowed CORS origins: ${allowedOrigins.join(', ')}`);
 });
 
 module.exports = app;
