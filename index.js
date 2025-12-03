@@ -8,6 +8,26 @@ const cors = require('cors');
 const path = require('path');
 require('dotenv').config();
 
+// Fix for duplicate CORS headers - intercept setHeader globally
+const originalSetHeader = express.response.setHeader;
+express.response.setHeader = function(name, value) {
+  if (name && name.toLowerCase() === 'access-control-allow-origin') {
+    // Remove any existing headers first
+    try {
+      if (this.getHeader('Access-Control-Allow-Origin')) {
+        this.removeHeader('Access-Control-Allow-Origin');
+      }
+    } catch (e) {
+      // Ignore if header doesn't exist
+    }
+    // Normalize value - take first value if comma-separated, remove trailing slash
+    const normalizedValue = String(value).split(',')[0].trim().replace(/\/+$/, '');
+    console.log(`🔧 Setting CORS header: ${normalizedValue} (from: ${value})`);
+    return originalSetHeader.call(this, 'Access-Control-Allow-Origin', normalizedValue);
+  }
+  return originalSetHeader.call(this, name, value);
+};
+
 // Import Zoho routes
 const { router: zohoRouter, initializeTokenManager: initZohoTokenManager } = require('./routes/zoho.routes');
 const { router: zohoFieldsRouter, initializeTokenManager: initZohoFieldsTokenManager } = require('./routes/zoho-fields.routes');
@@ -47,9 +67,15 @@ function getAllowedOrigins() {
 
 const allowedOrigins = getAllowedOrigins();
 
-// CORS middleware with proper header handling
-app.use(cors({
-  origin: function (origin, callback) {
+// CORS middleware - use single origin string if only one origin to avoid duplicates
+let corsOrigin;
+if (allowedOrigins.length === 1) {
+  // Use single origin string to prevent duplicate headers
+  corsOrigin = allowedOrigins[0];
+  console.log(`🔧 Using single CORS origin: ${corsOrigin}`);
+} else {
+  // Use function for multiple origins
+  corsOrigin = function (origin, callback) {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) {
       return callback(null, true);
@@ -74,47 +100,45 @@ app.use(cors({
     const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
     console.warn(`⚠️  CORS blocked origin: ${origin} (allowed: ${allowedOrigins.join(', ')})`);
     callback(new Error(msg), false);
-  },
+  };
+}
+
+app.use(cors({
+  origin: corsOrigin,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  // Ensure only one origin is returned
   preflightContinue: false,
   optionsSuccessStatus: 204
 }));
 
-// Additional middleware to ensure single CORS header (runs after CORS middleware)
+// Final middleware to clean up CORS headers before sending response
 app.use((req, res, next) => {
-  // Store original setHeader function
-  const originalSetHeader = res.setHeader.bind(res);
-  
-  // Override setHeader to prevent duplicate CORS headers
-  res.setHeader = function(name, value) {
-    if (name.toLowerCase() === 'access-control-allow-origin') {
-      // Remove any existing Access-Control-Allow-Origin headers first
-      if (res.getHeader('Access-Control-Allow-Origin')) {
+  // Intercept res.end to clean headers before sending
+  const originalEnd = res.end.bind(res);
+  res.end = function(...args) {
+    // Get all headers
+    const headers = res.getHeaders();
+    const corsHeaderValue = headers['access-control-allow-origin'];
+    
+    if (corsHeaderValue) {
+      // Normalize: take first value, remove trailing slash
+      const normalizedValue = String(corsHeaderValue).split(',')[0].trim().replace(/\/+$/, '');
+      
+      // Remove all existing headers (in case of duplicates)
+      try {
         res.removeHeader('Access-Control-Allow-Origin');
+      } catch (e) {
+        // Ignore
       }
-      // Normalize the value (remove trailing slash)
-      const normalizedValue = String(value).split(',')[0].trim().replace(/\/+$/, '');
-      return originalSetHeader('Access-Control-Allow-Origin', normalizedValue);
+      
+      // Set only one normalized header
+      res.setHeader('Access-Control-Allow-Origin', normalizedValue);
+      console.log(`✅ Final CORS header: ${normalizedValue} (was: ${corsHeaderValue})`);
     }
-    return originalSetHeader(name, value);
+    
+    return originalEnd.apply(this, args);
   };
-  
-  // Also handle the origin header directly
-  const origin = req.headers.origin;
-  if (origin) {
-    const normalizedOrigin = origin.replace(/\/+$/, '');
-    if (allowedOrigins.indexOf(normalizedOrigin) !== -1) {
-      // Remove any existing headers
-      if (res.getHeader('Access-Control-Allow-Origin')) {
-        res.removeHeader('Access-Control-Allow-Origin');
-      }
-      // Set only one header
-      res.setHeader('Access-Control-Allow-Origin', normalizedOrigin);
-    }
-  }
   
   next();
 });
